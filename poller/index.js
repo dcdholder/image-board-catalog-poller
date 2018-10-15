@@ -5,19 +5,18 @@
 //create an object with the labels as keys and an array of the result objects as objects
 //remove duplicates on a per-label, per-thread basis (threads meeting multiple search terms)
 //iterate through result objects and overwrite the cache with the relevant information
+const request = require('request-promise-native');
 
 const config   = require("./config.json");
-const SITE_URL = config.site;
 
 var db = {};
 
 function findThreadsNotifySubscribers() {
   //variables shared between promises without making dummy promises
   let searchDoc;
-  let boardList;
 
   let boardTermLabel;
-  let boards;
+  let relevantBoards;
   let linkByLabel;
 
   let globalDiffedResultsByWebhook;
@@ -31,10 +30,11 @@ function findThreadsNotifySubscribers() {
     boardList = values[1];
 
     boardTermLabel = mapBoardTermLabel(searchDoc,boardList);
+    relevantBoards = Object.keys(boardTermLabel);
 
     //construct the catalog request promises
     let boardCatalogPromises = [];
-    for (board of boardList) {
+    for (board of relevantBoards) {
       boardCatalogPromises.push(getBoardCatalog(board));
     }
 
@@ -43,8 +43,8 @@ function findThreadsNotifySubscribers() {
   }).then((values) => {
     //construct the board/catalog mapping
     let catalogs = {};
-    for (let i=0;i<boardList.length;i++) {
-      catalogs[boardList[i]] = values[i];
+    for (let i=0;i<relevantBoards.length;i++) {
+      catalogs[relevantBoards[i]] = values[i];
     }
 
     //for each board, search for each term which applies to that board
@@ -136,18 +136,54 @@ function getSearchDoc() {
   return Promise.resolve(searchDoc);
 }
 
+/*
 //TODO: real implementation
 function getBoardList() {
   let boards = require("./boards.json");
 
   return Promise.resolve(boards);
 }
+*/
 
+function getBoardList() {
+  return request({
+    "method": "GET",
+    "uri": config.api + "/boards.json",
+    "json": true
+  }).then((response) => {
+    let boards = [];
+
+    for (let boardEntry of response.boards) {
+      boards.push(boardEntry.board);
+    }
+
+    console.log(boards);
+    return Promise.resolve(boards);
+  }).catch((err) => {
+    console.log(err);
+  });
+}
+
+/*
 //TODO: real implementation
 function getBoardCatalog(board) {
   let catalog = require("./catalog.json");
 
   return Promise.resolve(catalog);
+}
+*/
+
+function getBoardCatalog(board) {
+  return request({
+    "method": "GET",
+    "uri": config.api + "/" + board + "/catalog.json",
+    "json": true
+  }).then((response) => {
+    console.log(response);
+    return Promise.resolve(response);
+  }).catch((err) => {
+    console.log(err);
+  });
 }
 
 function diffResultsByWebhook(resultsByWebhook,linkByLabel) {
@@ -240,7 +276,7 @@ function searchCatalog(catalog,labelsByTerm,board) {
 
         board: board,
         no:    thread,
-        link:  `${SITE_URL}/${board}/thread/${thread}`
+        link:  `${config.site}/${board}/thread/${thread}`
       };
 
       if (threadData[thread].sub) {result.subject = threadData[thread].sub;}
