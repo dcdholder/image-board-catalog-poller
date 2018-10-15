@@ -6,6 +6,9 @@
 //remove duplicates on a per-label, per-thread basis (threads meeting multiple search terms)
 //iterate through result objects and overwrite the cache with the relevant information
 
+const config   = require("./config.json");
+const SITE_URL = config.site;
+
 var db = {};
 
 function findThreadsNotifySubscribers() {
@@ -16,7 +19,8 @@ function findThreadsNotifySubscribers() {
   let boardTermLabel;
   let boards;
   let linkByLabel;
-  let resultsByWebhook;
+
+  let globalDiffedResultsByWebhook;
 
   //query DB for search doc and query API for board list concurrently
   let searchDocPromise = getSearchDoc();
@@ -26,23 +30,7 @@ function findThreadsNotifySubscribers() {
     searchDoc = values[0];
     boardList = values[1];
 
-    //map labels by board, then by search term
-    boardTermLabel = {};
-    for (let label in searchDoc) {
-      for (let board of searchDoc[label].boards) {
-        if (boardList.indexOf(board)!==-1) {
-          if (!boardTermLabel[board]) { //add board key if not present
-            boardTermLabel[board] = {};
-          }
-          for (let term of searchDoc[label].terms) {
-            if (!boardTermLabel[board][term]) { //add term key if not present for that board
-              boardTermLabel[board][term] = [];
-            }
-            boardTermLabel[board][term].push(label);
-          }
-        }
-      }
-    }
+    boardTermLabel = mapBoardTermLabel(searchDoc,boardList);
 
     //construct the catalog request promises
     let boardCatalogPromises = [];
@@ -56,7 +44,7 @@ function findThreadsNotifySubscribers() {
     //construct the board/catalog mapping
     let catalogs = {};
     for (let i=0;i<boardList.length;i++) {
-      catalogs[boards[i]] = values[i];
+      catalogs[boardList[i]] = values[i];
     }
 
     //for each board, search for each term which applies to that board
@@ -68,12 +56,13 @@ function findThreadsNotifySubscribers() {
     //for each label, collect all search results which match the label
     let searchResultsByLabel = {};
     for (let board in searchResults) {
-      let result = searchResults[board][i];
-      let label  = result.label;
-      if (!(label in searchResultsByLabel)) {
-        searchResultsByLabel[label] = [];
+      for (let result of searchResults[board]) {
+        let label = result.label;
+        if (!(label in searchResultsByLabel)) {
+          searchResultsByLabel[label] = [];
+        }
+        searchResultsByLabel[label].push(result);
       }
-      searchResultsByLabel[label].push(result);
     }
 
     //collect links by label
@@ -86,19 +75,12 @@ function findThreadsNotifySubscribers() {
     }
 
     //collect results by webhook
-    //TODO: may be duplicates if multiple labels get same results
-    resultsByWebhook = {};
-    for (let label in searchResultsByLabel) {
-      for (let webhook of searchDoc[label].webhooks) {
-        if (!(webhook in resultsByWebhook)) {
-          resultsByWebhook[webhook] = [];
-        }
-        resultsByWebhook[webhook].push(...searchResultsByLabel[label]);
-      }
-    }
+    let resultsByWebhook = getResultsByWebhook(searchDoc,searchResultsByLabel); //TODO: may be duplicates if multiple labels get same results
 
     return diffResultsByWebhook(resultsByWebhook,linkByLabel);
   }).then((diffedResultsByWebhook) => {
+    globalDiffedResultsByWebhook = diffedResultsByWebhook; //ugly as sin!
+
     //send out the results to webhooks (buffered by SQS and another dedicated function)
     //cache all links represented by results you sent out so only diffs are sent next time
     let notifySubscribersPromise = notifySubscribers(diffedResultsByWebhook);
@@ -106,27 +88,66 @@ function findThreadsNotifySubscribers() {
 
     return Promise.all([notifySubscribersPromise,cacheLinksPromise]);
   }).then(() => {
-    console.log(resultsByWebhook);
+    console.log(globalDiffedResultsByWebhook);
+    //console.log(JSON.stringify(globalDiffedResultsByWebhook));
   });
+}
+
+//map labels by board, then by search term
+function mapBoardTermLabel(searchDoc,boardList) {
+  let boardTermLabel = {};
+  for (let label in searchDoc) {
+    for (let board of searchDoc[label].boards) {
+      if (boardList.indexOf(board)!==-1) {
+        if (!boardTermLabel[board]) { //add board key if not present
+          boardTermLabel[board] = {};
+        }
+        for (let term of searchDoc[label].terms) {
+          if (!boardTermLabel[board][term]) { //add term key if not present for that board
+            boardTermLabel[board][term] = [];
+          }
+          boardTermLabel[board][term].push(label);
+        }
+      }
+    }
+  }
+
+  return boardTermLabel;
+}
+
+function getResultsByWebhook(searchDoc,searchResultsByLabel) {
+  let resultsByWebhook = {};
+  for (let label in searchResultsByLabel) {
+    for (let webhook of searchDoc[label].subscribers) {
+      if (!(webhook in resultsByWebhook)) {
+        resultsByWebhook[webhook] = [];
+      }
+      resultsByWebhook[webhook].push(...searchResultsByLabel[label]);
+    }
+  }
+
+  return resultsByWebhook;
 }
 
 //TODO: real implementation
 function getSearchDoc() {
-  let searchDoc   = {};
+  let searchDoc = require("./searchdoc.json");
 
-  let label       = "testLabel";
-  let searchTerms = ["testTermA","testTermB"];
-  let boards      = ["testBoardA","testBoardB"];
-  let subscribers = ["urlA","urlB"];
-
-  searchDoc[label] = {terms: terms, boards: boards, subscribers: subscribers};
-
-  return searchDoc;
+  return Promise.resolve(searchDoc);
 }
 
 //TODO: real implementation
 function getBoardList() {
-  return ["testBoardA", "testBoardB", "testBoardC"];
+  let boards = require("./boards.json");
+
+  return Promise.resolve(boards);
+}
+
+//TODO: real implementation
+function getBoardCatalog(board) {
+  let catalog = require("./catalog.json");
+
+  return Promise.resolve(catalog);
 }
 
 function diffResultsByWebhook(resultsByWebhook,linkByLabel) {
@@ -137,8 +158,8 @@ function diffResultsByWebhook(resultsByWebhook,linkByLabel) {
       diffedResultsByWebhook[webhook] = diffResultsUsingNewLinks(resultsByWebhook[webhook],newLinks);
     }
 
-    return Promise.resolve(diffedResults);
-  }
+    return Promise.resolve(diffedResultsByWebhook);
+  });
 }
 
 //TODO: real implementation
@@ -146,9 +167,9 @@ function identifyNewLinks(linkByLabel) {
   let newLinks = {};
   for (let label in linkByLabel) {
     newLinks[label] = [];
-    if (db.linksCache[label]) {
+    if (db.linksCache && db.linksCache[label]) { //check if there even IS a linksCache first
       for (let link of linkByLabel[label]) {
-        if (db.linksCache[label].findIndex(link)===-1) {
+        if (db.linksCache[label].indexOf(link)===-1) {
           newLinks[label].push(link);
         }
       }
@@ -163,7 +184,7 @@ function identifyNewLinks(linkByLabel) {
 function diffResultsUsingNewLinks(results,newLinks) {
   let diffedResults = [];
   for (let result of results) {
-    if (newLinks[result.label].findIndex(result.link)!==-1) {
+    if (newLinks[result.label].indexOf(result.link)!==-1) {
       diffedResults.push(result);
     }
   }
@@ -172,12 +193,16 @@ function diffResultsUsingNewLinks(results,newLinks) {
 }
 
 function searchCatalog(catalog,labelsByTerm,board) {
+  let pages = catalog;
+
   //collect thread subjects and op comments
   let threadData = {};
   for (let pageContents of pages) {
     let pageThreads = pageContents.threads;
     for (let pageThread of pageThreads) {
       let thread = pageThread.no;
+
+      threadData[thread] = {};
 
       if (pageThread.sub) {threadData[thread].sub = pageThread.sub;}
       if (pageThread.com) {threadData[thread].com = pageThread.com;}
@@ -190,8 +215,8 @@ function searchCatalog(catalog,labelsByTerm,board) {
     let matchedSearchTerms = [];
     for (let field in threadData[thread]) {
       for (let term in labelsByTerm) {
-        if (matchSearchTerm(threadData[thread][field],searchTerm)) {
-          matchedSearchTerms.push(searchTerm);
+        if (matchSearchTerm(threadData[thread][field],term)) {
+          matchedSearchTerms.push(term);
         }
       }
     }
@@ -214,7 +239,8 @@ function searchCatalog(catalog,labelsByTerm,board) {
         terms: termsByLabel[label],
 
         board: board,
-        no:    thread
+        no:    thread,
+        link:  `${SITE_URL}/${board}/thread/${thread}`
       };
 
       if (threadData[thread].sub) {result.subject = threadData[thread].sub;}
@@ -231,13 +257,6 @@ function matchSearchTerm(text,searchTerm) {
   var re = new RegExp(searchTerm);
 
   return re.test(text);
-}
-
-//TODO: real implementation
-function getBoardCatalog(board) {
-  let catalog = require(catalog.json);
-
-  return Promise.resolve(catalog);
 }
 
 //TODO: real implementation
